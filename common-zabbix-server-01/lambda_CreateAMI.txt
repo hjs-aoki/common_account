@@ -1,0 +1,71 @@
+import boto3
+import collections
+import datetime
+import sys
+import pprint
+
+ec = boto3.client('ec2')
+
+def lambda_handler(event, context):
+
+    #「キー:Env、値:Backup」のEC2インスタンスのフィルター
+    reservations = ec.describe_instances(
+        Filters=[
+            {'Name': 'tag:Evn', 'Values': ['Backup']},
+        ]
+    ).get(
+        'Reservations', []
+    )
+	
+    #AMI作成必要なインスタンス数量の合計
+    instances = sum(
+        [
+            [i for i in r['Instances']]
+            for r in reservations
+        ],[])
+		
+    print "Found %d instances that need backing up" % len(instances)
+
+    to_tag = collections.defaultdict(list)
+
+	#AMIが作成日から7日間で利用可能に設定する
+    for instance in instances:
+        try:
+            retention_days = [
+                int(t.get('Value')) for t in instance['Tags']
+                if t['Key'] == 'Retention'][0]
+        except IndexError:
+            retention_days = 7
+            
+            create_time = datetime.datetime.now()
+            create_fmt = create_time.strftime('%Y%m%d')
+        
+			#作成されたAMI名のフォーマット
+            AMIid = ec.create_image(InstanceId=instance['InstanceId'], Name="AMI-" +instance['InstanceId'] + "-daily-" + create_fmt, Description="Lambda created AMI of instance " + instance['InstanceId'] + " from " + create_fmt, NoReboot=True, DryRun=False)
+
+            pprint.pprint(instance)
+            
+            to_tag[retention_days].append(AMIid['ImageId'])
+			
+            #AMIが保存される残時間情報の印刷 
+            print "Retaining AMI %s of instance %s for %d days" % (
+                AMIid['ImageId'],
+                instance['InstanceId'],
+                retention_days,
+            )
+
+    print to_tag.keys()
+    
+	#AMIの削除日カウントの目的として、作成されたAMIにキーや値などを付ける
+    for retention_days in to_tag.keys():
+        delete_date = datetime.date.today() + datetime.timedelta(days=retention_days)
+        delete_fmt = delete_date.strftime('%m%d%Y')
+        print "Will delete %d AMIs on %s" % (len(to_tag[retention_days]), delete_fmt)
+    
+        ec.create_tags(
+            Resources=to_tag[retention_days],
+            Tags=[
+                {'Key': 'DeleteOn', 'Value': delete_fmt},
+            ]
+        )
+    
